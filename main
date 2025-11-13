@@ -1,0 +1,469 @@
+import os.path as osp
+import torch.nn.functional as F
+import torch_geometric
+from torch_geometric.datasets import TUDataset
+from torch_geometric.data import DataLoader
+import random
+from models import simclr, loss_cal
+from counterfactual_example import CounterfactualModule, counterfactual_loss_adj, AdjPerturbation, FeaturePerturbation, counterfactual_loss_attr
+from evaluate_embedding import evaluate_embedding
+import argparse
+from pretrain.gsimclr import Pretrain
+import torch
+
+
+
+
+def prepare_dataset(dataset, model, device, num_epochs_for_neg_adj, learning_rate_adj, gamma_adj,
+                    epsilion_adj, num_epochs_for_neg_attr, learning_rate_attr, gamma_attr, epsilion_attr,
+                    std_dev, dataset_name, num_hidden, seed, expectation, omega, n, pretrained, save_path=None):
+    dataset = list(dataset)
+
+    random.seed(seed)
+    random.shuffle(dataset)
+
+    num_features = dataset[0].x.shape[1]
+    num_classes = get_num_classes(dataset)
+
+    train_dataset = dataset
+    random.shuffle(train_dataset)
+
+    num_nodes = sum([graph.num_nodes for graph in dataset])
+    num_features = dataset[0].x.shape[1]
+
+    layers = 5
+    save_path = save_path
+
+    prior = 'False'
+    num_layers = 5
+
+    model = Pretrain(num_hidden, num_layers, prior, num_features, num_classes).to(device)
+
+    if pretrained:
+        # model.load_state_dict(torch.load(save_path, map_location=device)["model_state_dict"])
+        model.load_state_dict(torch.load(save_path, map_location=device))
+
+    model.eval()
+
+    print(f"------------------start generating counterfactual adj samples------------------")
+    train_dataset = train_neg_adj(model, train_dataset, num_epochs_for_neg_adj, num_classes, device, gamma_adj, epsilion_adj, learning_rate_adj)
+    print(f"------------------start generating counterfactual attr samples------------------")
+    train_dataset = train_neg_attr(model, train_dataset, num_epochs_for_neg_attr, num_classes, device, gamma_attr, epsilion_attr, learning_rate_attr, num_nodes, num_features)
+    print('neg done')
+
+    train_dataset = generate_positive_samples(model, num_classes, train_dataset, device, std_dev, expectation, omega, n)
+    print('pos done')
+
+    return train_dataset, layers, num_classes
+
+
+def generate_positive_samples(model, num_classes, train_dataset, device, std_dev, expectation, omega, n):
+    model.eval()
+    graph_all = 0
+    correct = 0
+    origin_edge_num = 0
+    perturbed_edge_num = 0
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
+    for data in train_loader:
+        num_edges = data.edge_index.size(1)
+        edge_weight = torch.ones(num_edges).to(device)
+        out_origin = model(data.x.requires_grad_(True).to(device), data.edge_index.to(device), data.batch.to(device), edge_weight.requires_grad_(True))[0]
+        P = out_origin.argmax(dim=1)
+        P_origin_values = out_origin[torch.arange(len(out_origin)), P].sum()
+        grad_origin_edges = torch.autograd.grad(outputs=P_origin_values, inputs=edge_weight, create_graph=True, retain_graph=True)
+        score_origin_edges = grad_origin_edges[0]
+
+        grad_origin_attr = torch.autograd.grad(outputs=P_origin_values, inputs=data.x, create_graph=True, retain_graph=True)
+        score_origin_attr = torch.mul(grad_origin_attr[0], data.x).to(device)
+
+        origin_grad_graph = torch.zeros((data.x.size(0), data.x.size(0))).to(device)
+
+        for i in range(edge_weight.size(0)):
+            origin_grad_graph[data.edge_index[0][i]][data.edge_index[1][i]] = score_origin_edges[i]
+
+        score_negative_weight_list = []
+        score_negative_index_list = []
+        score_negative_attr_list = []
+        for num in range(num_classes-1):
+            edge_index_masked = getattr(data, f"edge_index_masked_{num}")
+            x_masked = getattr(data, f'x_masked_{num}')
+
+            num_edges = edge_index_masked.size(1)
+            edge_weight_masked = torch.ones(num_edges).to(device)
+            x_masked = x_masked.requires_grad_(True).to(device)
+
+            out_negative_adj = model(data.x.to(device), edge_index_masked.to(device), data.batch.to(device), edge_weight_masked.requires_grad_(True).to(device))[0]
+            P_negative_values_adj = out_negative_adj[torch.arange(len(out_origin)), P].sum()
+
+            out_negative_attr = model(x_masked, data.edge_index.to(device), data.batch.to(device))[0]
+            P_negative_values_attr = out_negative_attr[torch.arange(len(out_origin)), P].sum()
+
+            grad_negative = torch.autograd.grad(outputs=P_negative_values_attr, inputs=x_masked, create_graph=True,
+                                                retain_graph=True)
+            score_negative_attr = torch.mul(grad_negative[0], x_masked)
+            score_negative_attr_list.append(score_negative_attr)
+
+            grad_negative_adj = torch.autograd.grad(outputs=P_negative_values_adj, inputs=edge_weight_masked, create_graph=True,
+                                                retain_graph=True)
+            score_negative_adj = grad_negative_adj[0]
+            score_negative_weight_list.append(score_negative_adj)
+            score_negative_index_list.append(edge_index_masked)
+
+        num_nodes = data.x.size(0)
+        negative_grad_graphs = []
+        for num in range(num_classes-1):
+            grad_graph = torch.zeros((num_nodes, num_nodes)).to(device)
+            for i in range(score_negative_weight_list[num].size(0)):
+                grad_graph[score_negative_index_list[num][0][i]][score_negative_index_list[num][1][i]] = score_negative_weight_list[num][i]
+            negative_grad_graphs.append(grad_graph)
+
+        score_negative_list_edge = torch.stack(negative_grad_graphs)
+        negative_grad_graph = score_negative_list_edge.mean(dim=0).to(score_origin_edges.device)
+
+        score_negative_attr_list = torch.stack(score_negative_attr_list)
+        score_negative_attr = score_negative_attr_list.mean(dim=0).to(device)
+
+        M_promoted_attr = torch.relu(score_negative_attr - score_origin_attr - omega)
+        M_suppressed_attr = torch.relu(score_origin_attr - score_negative_attr - omega)
+
+        mask_promoted_attr = (M_promoted_attr != 0)
+        mask_suppressed_attr = (M_suppressed_attr != 0)
+
+        noise = torch.randn_like(data.x) * std_dev
+        noise_adj = torch.randn_like(negative_grad_graph) * std_dev
+
+        M_promoted_adj = torch.relu(negative_grad_graph - origin_grad_graph)
+        M_suppressed_adj = torch.relu(origin_grad_graph - negative_grad_graph)
+
+        pro_mask = M_promoted_adj > 0
+        sup_mask = M_suppressed_adj > 0
+        top_k_promoted = int(pro_mask.sum() * 0.1)
+        top_k_suppressed = int(sup_mask.sum() * 0.1)
+        values_promoted, indices_promoted = torch.topk(M_promoted_adj.flatten(), top_k_promoted, largest=True)
+        values_suppressed, indices_suppressed = torch.topk(M_suppressed_adj.flatten(), top_k_suppressed, largest=True)
+        mask_promoted_adj = torch.zeros_like(M_promoted_adj, dtype=bool)
+        mask_suppressed_adj = torch.zeros_like(M_suppressed_adj, dtype=bool)
+
+        mask_promoted_adj.view(-1)[indices_promoted] = True
+        mask_suppressed_adj.view(-1)[indices_suppressed] = True
+
+        for i in range(n):
+
+            noise = noise.to(device)
+
+            noise[mask_promoted_attr] -= expectation
+            noise[mask_suppressed_attr] += expectation
+
+            x_positive = data.x.to(device) + noise.to(device)
+            x_positive = x_positive.detach().to(device)
+
+
+            M_suppressed_transformed = torch.where(mask_suppressed_adj, torch.tensor(1.0).to(device),
+                                                   torch.tensor(0.0).to(device))
+            M_promoted_transformed = torch.where(mask_promoted_adj, torch.tensor(-1.0).to(device), torch.tensor(0.0).to(device))
+            adj = torch_geometric.utils.to_dense_adj(data.edge_index)[0]
+
+
+            if adj.size(0) < num_nodes:
+                zeros_to_add = num_nodes - adj.size(0)
+                padding = torch.zeros((zeros_to_add, adj.size(0)), device=adj.device)
+                adj = torch.cat([adj, padding], dim=0)
+                padding = torch.zeros((num_nodes, zeros_to_add), device=adj.device)
+                adj = torch.cat([adj, padding], dim=1)
+
+            adj_transformed = adj.to(device) + M_suppressed_transformed + M_promoted_transformed
+
+            adj_transformed = torch.where(adj_transformed >= 1, 1, 0)
+
+            origin_edge_num += data.edge_index.size(1)
+            perturbed_edge_num += torch.sum(adj_transformed)
+
+            edge_index_pos = torch_geometric.utils.dense_to_sparse(adj_transformed)[0]
+
+            edge_name = f"edge_index_pos_{i}"
+            x_name = f"x_pos_{i}"
+
+            setattr(train_dataset[graph_all], edge_name, edge_index_pos)
+            setattr(train_dataset[graph_all], x_name, x_positive)
+
+        graph_all += 1
+
+    return train_dataset
+
+def train_neg_attr(model, train_dataset, num_epochs_for_neg, num_classes, device, gamma, epsilion, learning_rate, num_nodes, num_features):
+    saved_x_masked = []
+    train_loader = DataLoader(train_dataset, batch_size=len(train_dataset), shuffle=False)
+    counterfactual_module = FeaturePerturbation(num_nodes, num_features ,num_classes).to(device)
+    optimizer = torch.optim.Adam(counterfactual_module.parameters(), lr=learning_rate, weight_decay=5e-4)
+    # optimizer = torch.optim.Adam(list(model.parameters()) + list(counterfactual_module.parameters()), lr=learning_rate, weight_decay=5e-4)
+    for epoch in range(1, num_epochs_for_neg):
+        model.eval()
+        # model.train()
+        counterfactual_module.train()
+
+        for data in train_loader:
+            x_masked = counterfactual_module(data.x).to(device)
+
+            loss_all = 0
+            out_origin = model(data.x.to(device), data.edge_index.to(device), data.batch.to(device))[0]
+            for num in range(num_classes-1):
+                out_masked = model(x_masked[:,num_features*num:num_features*(num+1)], data.edge_index.to(device), data.batch.to(device))[0]
+                loss_k = counterfactual_loss_attr(out_origin, out_masked, data.x.to(device), x_masked[:,num_features*num:num_features*(num+1)]
+                                                  , epoch, gamma, epsilion, k=num)
+                loss_all += loss_k
+
+            optimizer.zero_grad()
+            loss_all.backward()
+            optimizer.step()
+
+            if epoch == (num_epochs_for_neg - 1):
+                saved_x_masked.extend(x_masked.detach().cpu())
+                saved_x_masked = torch.stack(saved_x_masked).to(device)
+                for i, graph in enumerate(train_dataset):
+                    mask = data.batch == i
+                    x_masked_for_data = saved_x_masked[mask]
+                    for num in range(num_classes-1):
+
+                        attribute_name = f"x_masked_{num}"
+                        setattr(graph, attribute_name, x_masked_for_data[:,num_features*num:num_features*(num+1)])
+
+    return train_dataset
+
+
+def train_neg_adj(model, train_dataset, num_epochs_for_neg, num_classes, device, gamma, epsilion, learning_rate):
+    saved_x_masked = []
+    sum_same = 0
+    graph_all = 0
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
+    for data in train_loader:
+        num_nodes, _ = data.x.size()
+        counterfactual_module = AdjPerturbation(num_nodes, num_classes).to(device)
+        model.eval()
+        # model.train()
+        counterfactual_module.train()
+        optimizer = torch.optim.Adam(counterfactual_module.parameters(), lr=learning_rate, weight_decay=5e-4)
+        # optimizer = torch.optim.Adam(list(model.parameters()) + list(counterfactual_module.parameters()), lr=learning_rate, weight_decay=5e-4)
+
+        for epoch in range(0, num_epochs_for_neg):
+            edge_index_masked_list, edge_weight_list = counterfactual_module(data.edge_index)
+
+            out_origin = model(data.x.to(device), data.edge_index.to(device), data.batch.to(device))[0]
+            loss_all = 0
+            for num in range(num_classes-1):
+                edge_index_masked = edge_index_masked_list[num]
+                edge_weight = edge_weight_list[num]
+                out_masked = model(data.x.to(device), edge_index_masked.to(device), data.batch.to(device), edge_weight=edge_weight)[0]
+                loss_k = counterfactual_loss_adj(out_origin, out_masked, data.edge_index.to(device), edge_index_masked, edge_weight, epoch, gamma, epsilion, k=num)
+                loss_all += loss_k
+
+            optimizer.zero_grad()
+            loss_all.backward()
+            optimizer.step()
+
+            if epoch == (num_epochs_for_neg - 1):
+                edge_index_masked_list, edge_weight_list = counterfactual_module(data.edge_index)
+                for num in range(num_classes-1):
+
+                    mask = (edge_weight_list[num] > 0.5)
+                    edge_index_masked_filter = edge_index_masked_list[num][:, mask]
+                    edge_name = f"edge_index_masked_{num}"
+                    setattr(train_dataset[graph_all], edge_name, edge_index_masked_filter)
+        graph_all += 1
+
+    return train_dataset
+
+
+def prepare_dataset_onehot_y(dataset):
+
+    y_set = set()
+    for data in dataset:
+        y_set.add(int(data.y))
+    num_classes = len(y_set)
+
+    for data in dataset:
+        data.y = F.one_hot(data.y, num_classes=num_classes).to(torch.float)[0]
+    return dataset
+
+def get_num_classes(dataset):
+
+    y_set = set()
+    for data in dataset:
+        y_set.add(int(data.y))
+    num_classes = len(y_set)
+
+
+    return num_classes
+
+
+def run(epoch_for_neg_adj, lr_for_neg_adj, gamma_adj, epsilion_adj,
+        epoch_for_neg_attr, lr_for_neg_attr, gamma_attr, epsilion_attr,
+        std_dev,  expectation, omega, lr_for_model, num_epochs_for_model, weight_decay, dataset, T):
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_path', type=str, default="./")
+    parser.add_argument('--dataset', type=str, default="AIDS")
+    parser.add_argument('--seed', type=int, default=1314)
+    # parameters for negative samples
+    parser.add_argument('--model', type=str, default="GCN")
+    parser.add_argument('--num_hidden', type=int, default=64)
+
+    parser.add_argument('--epoch_for_neg_adj', type=int, default=150)
+    parser.add_argument('--lr_for_neg_adj', type=float, default=0.05)
+    parser.add_argument('--gamma_adj', type=float, default=2.5)
+    parser.add_argument('--epsilion_adj', type=float, default=0.1)
+
+    parser.add_argument('--epoch_for_neg_attr', type=int, default=150)
+    parser.add_argument('--lr_for_neg_attr', type=float, default=0.05)
+    parser.add_argument('--gamma_attr', type=float, default=2.5)
+    parser.add_argument('--epsilion_attr', type=float, default=0.1)
+    parser.add_argument('--std_dev', type=float, default=0.1)
+    parser.add_argument('--expectation', type=float, default=0.1)
+    # parameters for model
+    parser.add_argument('--lr_for_model', type=float, default=0.01)
+    parser.add_argument('--num_epochs_for_model', type=int, default=200)
+    parser.add_argument('--patience', type=int, default=50)
+    parser.add_argument('--hidden_dim', type=int, default=32)
+    parser.add_argument('--num_layers', type=int, default=5)
+    parser.add_argument('--weight_decay', type=float, default=1e-5)
+
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--n', type=int, default=4)  # number of positive samples
+    parser.add_argument('--pretrained', type=bool, default=True)
+    args = parser.parse_args()
+
+    data_path = args.data_path
+    dataset_name = dataset
+    seed = args.seed
+    pretrained = args.pretrained
+
+    num_epochs_for_model = num_epochs_for_model
+    hidden_dim = args.hidden_dim
+    num_layers = args.num_layers
+    weight_decay = weight_decay
+    expectation = expectation
+
+
+    num_hidden = args.num_hidden
+    batch_size = args.batch_size
+    model = args.model
+    learning_rate_for_model = lr_for_model
+
+    num_epochs_for_neg_adj = epoch_for_neg_adj
+    learning_rate_adj = lr_for_neg_adj
+    gamma_adj = gamma_adj
+    epsilion_adj = epsilion_adj
+
+    num_epochs_for_neg_attr = epoch_for_neg_attr
+    learning_rate_attr = lr_for_neg_attr
+    gamma_attr = gamma_attr
+    epsilion_attr = epsilion_attr
+
+    patience = args.patience
+    std_dev = std_dev
+
+    n = args.n
+
+
+
+    torch.manual_seed(seed)
+
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+    path = osp.join(data_path, dataset_name)
+    dataset = TUDataset(path, name=dataset_name, use_node_attr=True)
+
+    dataset = list(dataset)
+
+    num_gc_layers = 5
+    hidden_dim_pretrain = 64
+    lr_pretrain = 0.01
+
+    save_path = f"pretrain/models/model_{dataset_name}_{num_gc_layers}_layers_{hidden_dim_pretrain}_dim_{lr_pretrain}_lr.pth"
+
+    for idx, data in enumerate(dataset):
+        data.id = idx
+    train_dataset, layers, num_classes = prepare_dataset(dataset, model, device, num_epochs_for_neg_adj,
+                                                         learning_rate_adj, gamma_adj, epsilion_adj,
+                                                         num_epochs_for_neg_attr, learning_rate_attr, gamma_attr, epsilion_attr,
+                                                         std_dev, dataset_name, num_hidden, seed,  expectation, omega, n, pretrained, save_path)
+
+    layers = 5
+
+    dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+    accuracies = {'val':[], 'test':[]}
+
+    dataset_num_features = dataset[0].x.shape[1]
+    model_unsupervised = simclr(hidden_dim, num_layers, False, dataset_num_features).to(device)
+
+    early_stop = 0
+    optimizer_unsupervised = torch.optim.Adam(model_unsupervised.parameters(), lr=learning_rate_for_model, weight_decay=weight_decay)
+
+    minest_loss = 1000
+    print('start training')
+    best_acc = 0
+    for epoch in range(1, num_epochs_for_model + 1):
+        loss_all = 0
+        model_unsupervised.train()
+
+        early_stop += 1
+        for data in dataloader:
+
+            node_num, _ = data.x.size()
+            data = data.to(device)
+            x_origin = model_unsupervised(data.x, data.edge_index, data.batch, data.num_graphs)
+
+            out_negative_list = []
+            for num in range(num_classes-1):
+                edge_index_masked = getattr(data, f"edge_index_masked_{num}")
+                x_masked = getattr(data, f'x_masked_{num}')
+                out_negative_1 = model_unsupervised(data.x.to(device), edge_index_masked.to(device), data.batch.to(device), data.num_graphs)
+                out_negative_2 = model_unsupervised(x_masked.to(device), data.edge_index.to(device), data.batch.to(device), data.num_graphs)
+                out_negative_list.append(out_negative_1)
+                out_negative_list.append(out_negative_2)
+            x_negatives = torch.stack(out_negative_list)
+
+            loss = 0
+
+            for i in range(n):
+                pos_edge_index = getattr(data, f"edge_index_pos_{i}")
+                x_positive = getattr(data, f"x_pos_{i}")
+                x_positive = model_unsupervised(x_positive.to(device), pos_edge_index.to(device), data.batch.to(device), data.num_graphs)
+
+                loss_1 = loss_cal(x_origin, x_positive, x_negatives, T)
+                loss += loss_1
+
+            optimizer_unsupervised.zero_grad()
+            loss.backward()
+            optimizer_unsupervised.step()
+
+            loss_all += loss.item() * data.num_graphs
+
+        print('Epoch {}, Loss {}'.format(epoch, loss_all / len(dataloader)))
+
+        if epoch % 5 == 0:
+            model_unsupervised.eval()
+            emb, y = model_unsupervised.encoder.get_embeddings(dataloader)
+            acc_val, acc = evaluate_embedding(emb, y)
+            if acc > best_acc:
+                best_acc = acc
+            accuracies['val'].append(acc_val)
+            accuracies['test'].append(acc)
+            print(accuracies['val'][-1], accuracies['test'][-1])
+
+    return best_acc
+
+
+config = (20, 0.001, 5.0, 0.005, 300, 0.01, 7.5, 0.1, 0.3, 0.15, 0.01, 0.0001, 200, 0.0001, 'ENZYMES', 0.1)
+
+if __name__ == "__main__":
+    acc_list = []
+    for i in range(5):
+        print("--------------------------Start the {}th run-------------------".format(i + 1))
+        acc = run(*config)
+        acc_list.append(acc)
+        print("accuracy:", acc)
+
+
+    print(f"Average accuracy over 5 runs: {sum(acc_list) / len(acc_list)}")
+
