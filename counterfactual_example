@@ -1,0 +1,209 @@
+import math
+import torch
+import torch.nn as nn
+import torch_geometric.utils
+
+
+class FeatureMasking(nn.Module):
+    def __init__(self, num_nodes, num_features, gamma):
+        super(FeatureMasking, self).__init__()
+        x_value_for_gamma = float(f"{-math.log(1.0 / gamma - 1):.5g}")
+        self.M_b = nn.Parameter(torch.randn(num_nodes, num_features) * 0.01 + x_value_for_gamma)
+        self.gamma = gamma
+
+    def forward(self, X):
+        """
+        应用特征遮罩到特征矩阵X上。
+
+        参数:
+        - X: torch.Tensor, 原始特征矩阵，大小为(N, h)
+
+        返回:
+        - X_tilde: torch.Tensor, 经过遮罩处理的特征矩阵，大小为(N, h)
+        """
+        M_b_thresholded = (torch.sigmoid(self.M_b) >= self.gamma).float()
+
+        M_b_thresholded = M_b_thresholded.to(X.device)
+
+        X_tilde = torch.mul(M_b_thresholded, X)
+
+        return X_tilde
+
+
+class CounterfactualModule(nn.Module):
+    def __init__(self, num_nodes, num_features, gamma=0.3):
+        super(CounterfactualModule, self).__init__()
+
+        self.feature_masking = FeatureMasking(num_nodes, num_features, gamma)
+        self.feature_perturbation = nn.Parameter(torch.randn(num_nodes, num_features))
+
+    def create_feature_matrix(self, data):
+        all_features = []
+        index = []
+        node_count = 0
+
+        for graph in data:
+            features = graph.x
+            num_nodes = features.shape[0]
+            all_features.append(features)
+            index.extend([1] * num_nodes)
+            node_count += num_nodes
+
+        feature_matrix_all_nodes = torch.cat(all_features, dim=0)
+
+        return feature_matrix_all_nodes, index
+
+
+    def forward(self, data):
+
+        feature_matrix_all_nodes, mask = self.create_feature_matrix(data)
+        feature_matrix_all_nodes_masked = self.feature_masking(feature_matrix_all_nodes)
+
+        return feature_matrix_all_nodes_masked
+
+
+def loss_1(P, P_masked, out_origin, out_masked, epoch, gamma=1.0):
+    logit_squared_P = out_masked[torch.arange(len(out_masked)), P] ** 2
+
+    not_P_mask = torch.arange(out_origin.size(1)).to(P.device) != P.unsqueeze(1)
+    out_origin_not_P = out_origin[not_P_mask].view(out_origin.size(0), -1)
+    out_masked_not_P = out_masked[not_P_mask].view(out_masked.size(0), -1)
+    mse_not_P = nn.MSELoss()(out_origin_not_P, out_masked_not_P)
+    loss = torch.mean(logit_squared_P) * gamma + mse_not_P
+
+    return loss
+
+def loss_2(P, out_origin, out_masked, epoch, k, gamma=1.0):
+    mask = torch.ones(out_origin.size(), dtype=bool)
+    mask[torch.arange(len(out_origin)), P] = False
+    out_masked_not_P = out_masked[mask].view(out_masked.size(0), -1)
+    out_origin_not_P = out_origin[mask].view(out_origin.size(0), -1)
+
+    logit_squared_P = out_masked[torch.arange(len(out_masked)), P] ** 2
+    logit_squared_k = out_masked_not_P[torch.arange(len(out_masked)), k] ** 2
+
+    if out_origin.size(1) == 2:
+        mse_not_P = 0
+    else:
+        mask_k = torch.ones((out_origin.size(0), out_origin.size(1) - 1), dtype=bool)
+        mask_k[torch.arange(len(out_origin)), k] = False
+
+        out_origin_not_P_k = out_origin[mask].view(out_origin.size(0), -1)
+        out_origin_not_P_k = out_origin_not_P_k[mask_k].view(out_origin.size(0), -1)
+
+        out_masked_not_P_k = out_masked[mask].view(out_masked.size(0), -1)
+        out_masked_not_P_k = out_masked_not_P_k[mask_k].view(out_masked.size(0), -1)
+
+        mse_not_P = nn.MSELoss()(out_origin_not_P_k, out_masked_not_P_k)
+    loss = (torch.mean(logit_squared_P) - torch.mean(logit_squared_k)) * gamma + mse_not_P
+
+    return loss
+
+
+def counterfactual_loss_adj(out_origin, out_masked, edge_index_origin, edge_index_masked, edge_weight,epoch, gamma, epsilon, k):
+    """
+    Computes the counterfactual loss based on the given objective function.
+
+    Args:
+        out_origin (Tensor): Original output from the model.
+        out_masked (Tensor): Masked output from the model.
+        gamma (float): Hyperparameter balancing the two losses.
+        epsilon (float): Perturbation threshold for L2 norm constraint.
+
+    Returns:
+        Tensor: Computed loss.
+    """
+    P = out_origin.argmax(dim=1)
+
+    loss2 = loss_2(P, out_origin, out_masked, epoch, k, gamma)
+
+
+    adj_origin = torch_geometric.utils.to_dense_adj(edge_index_origin)[0]
+    adj_masked = torch_geometric.utils.to_dense_adj(edge_index_masked)[0]
+    mask = (adj_masked != 0)
+    if adj_origin.size(0) < adj_masked.size(0):
+        zeros_to_add = adj_masked.size(0) - adj_origin.size(0)
+        padding = torch.zeros((zeros_to_add, adj_origin.size(0)), device=adj_origin.device)
+        adj_origin = torch.cat([adj_origin, padding], dim=0)
+        padding = torch.zeros((adj_masked.size(0), zeros_to_add), device=adj_origin.device)
+        adj_origin = torch.cat([adj_origin, padding], dim=1)
+    adj_origin_filtered = adj_origin[mask]
+    origin_weight = adj_origin_filtered.view(-1)
+    l2_norm = torch.norm(origin_weight - edge_weight, p=2)
+
+    return loss2 + epsilon * l2_norm
+
+
+def counterfactual_loss_attr(out_origin, out_masked, input_origin, input_masked, epoch, gamma, epsilon, k):
+    """
+    Computes the counterfactual loss based on the given objective function.
+
+    Args:
+        out_origin (Tensor): Original output from the model.
+        out_masked (Tensor): Masked output from the model.
+        gamma (float): Hyperparameter balancing the two losses.
+        epsilon (float): Perturbation threshold for L2 norm constraint.
+
+    Returns:
+        Tensor: Computed loss.
+    """
+    P = out_origin.argmax(dim=1)
+    loss2 = loss_2(P, out_origin, out_masked, epoch, k, gamma)
+    l2_norm = torch.norm(input_origin - input_masked, p=2)
+
+    return loss2 + l2_norm * epsilon
+
+
+class AdjPerturbation(nn.Module):
+    def __init__(self, num_nodes, num_classes):
+        super(AdjPerturbation, self).__init__()
+        self.edge_perturbation = nn.Parameter(torch.rand(num_nodes, num_nodes*(num_classes - 1)))
+        self.num_nodes = num_nodes
+        self.num_classes = num_classes
+
+    def forward(self, edge_index):
+        adj = torch_geometric.utils.to_dense_adj(edge_index)[0]
+
+        if adj.size(0) < self.num_nodes:
+            zeros_to_add = self.num_nodes - adj.size(0)
+            padding = torch.zeros((zeros_to_add, adj.size(0)), device=adj.device)
+            adj = torch.cat([adj, padding], dim=0)
+            padding = torch.zeros((self.num_nodes, zeros_to_add), device=adj.device)
+            adj = torch.cat([adj, padding], dim=1)
+
+
+        edge_index_masked_list = []
+        edge_weight_list = []
+        for num in range(self.num_classes - 1):
+
+            adj_masked = torch.abs(adj.to(self.edge_perturbation.device) - self.edge_perturbation[:, num * self.num_nodes:(num + 1) * self.num_nodes])
+            edge_index_masked, edge_weight = torch_geometric.utils.dense_to_sparse(adj_masked)
+            edge_index_masked_list.append(edge_index_masked)
+            edge_weight_list.append(edge_weight)
+
+        return edge_index_masked_list, edge_weight_list
+
+def get_num_classes(dataset):
+
+    y_set = set()
+    for data in dataset:
+        y_set.add(int(data.y))
+    num_classes = len(y_set)
+
+
+    return num_classes
+
+class FeaturePerturbation(nn.Module):
+    def __init__(self, num_nodes, num_features, num_classes):
+        super(FeaturePerturbation, self).__init__()
+        self.num_classes = num_classes
+        self.num_nodes = num_nodes
+        self.num_features = num_features
+        self.feature_perturbation = nn.Parameter(torch.randn(self.num_nodes, self.num_features * (self.num_classes - 1)))
+
+    def forward(self, feature):
+        feature_num_classes = feature.repeat(1, self.num_classes - 1)
+
+        x_masked = feature_num_classes.to(self.feature_perturbation.device) + self.feature_perturbation
+
+        return x_masked
